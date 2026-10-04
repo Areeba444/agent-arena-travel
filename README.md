@@ -1,249 +1,298 @@
-# Agent Arena student starter
+# Travel Itinerary Builder — Agent Arena Autonomous Agent
 
-This is runnable infrastructure, NOT a completed assignment. `/arena/run` and `/chat`
-return `failed` with `stop_reason: not_implemented` until you implement app/agent.py.
-No model API is called by this starter. It includes no instructor keys or solution.
+An autonomous, sandboxed AI agent built for the **Agent Arena** evaluation framework. The agent ingests unstructured and untrusted travel confirmations (flights, hotels, trains, excursions), validates and stores them into structured records, detects scheduling conflicts, resolves ambiguities via multi-turn dialogue, and compiles day-by-day trip itineraries.
 
-## Start locally on Windows
-Use Python 3.12 or newer. Extract this folder first, then open a terminal inside it.
+---
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env
-.\.venv\Scripts\python.exe run.py
+## 1. Problem Statement
+
+Travelers frequently receive fragmented reservation confirmations across emails, PDF tickets, and SMS notices. These external texts are inherently **untrusted** and may contain conflicting schedules, incomplete information (e.g., missing travel dates), or adversarial prompt injections. 
+
+The **Travel Itinerary Builder** solves this by:
+1. Ingesting raw booking texts within strict structural delimiters.
+2. Normalizing timestamps and dates to UTC to prevent timezone skew.
+3. Checking interval overlaps `[start, end)` within identical categories (e.g., overlapping flights or overlapping hotels).
+4. Generating structured day-by-day itineraries while strictly refusing real-world actions (payments, cancellations, external emails) through enforceable autonomy boundaries.
+
+---
+
+## 2. Agent Design Canvas
+
+| Design Dimension | Specification |
+| :--- | :--- |
+| **1. Primary Goal** | Extract bookings, detect same-category schedule conflicts, request clarifications for incomplete bookings, and generate a day-by-day sandbox itinerary. |
+| **2. Untrusted Inputs** | External confirmation snippets, email text, and vouchers provided in `external_context` (enclosed in strict `<<<UNTRUSTED_EXTERNAL_DATA>>>` delimiters). |
+| **3. Action Space** | Strictly sandboxed tools: `record_bookings`, `check_conflicts`, `build_itinerary`. Real actions (charge card, email hotel, live booking) are disallowed. |
+| **4. Environment Gateway** | Unified `call_tool()` gateway handling Pydantic input/output validation, execution timeouts, automated retries (max 2), and fault injection. |
+| **5. Control Loop** | Bounded decision loop: `Observe -> Model Decision -> Schema & Semantic Validation -> Tool Gateway -> Update State -> Repeat/Stop`. Controlled by Python code, never by the LLM. |
+| **6. Autonomy Boundary** | Autonomous sandbox planning only. Real-world destructive or external side-effects trigger terminal status `approval_required` or `blocked`. |
+| **7. Validation & Repair** | Pydantic v2 schema parsing + semantic validator (`validate_decision_semantics`). Max 1 repair attempt per run; second failure yields `contract_error`. |
+| **8. Memory Policy** | In-memory sliding window per `session_id` (max 12 messages, max 24,000 characters). Session memory is volatile and resets upon server restart. |
+| **9. Resource Budgets** | Max 6 logical steps, max 2 tool retries, max 800 output tokens, max 20,000 input characters, 12s per-call timeout, 40s total wall-clock budget. |
+
+---
+
+## 3. Architecture & Control Flow
+
+### Control Flow Diagram
+
+```mermaid
+flowchart TD
+    Start([HTTP Request /arena/run or /chat]) --> BudgetCheck{Input Budget <= 20,000 chars?}
+    BudgetCheck -- No --> BudgetExceeded[status: budget_exceeded<br>stop_reason: input_budget_exceeded]
+    BudgetCheck -- Yes --> InitState[Initialize AgentState & Start Timer]
+    
+    InitState --> LoopStart{step_count < max_steps?}
+    LoopStart -- No --> StepBudget[status: budget_exceeded<br>stop_reason: step_budget_reached]
+    
+    LoopStart -- Yes --> WallClockCheck{Remaining Time > 1.0s?}
+    WallClockCheck -- No --> TimeBudget[status: budget_exceeded<br>stop_reason: time_budget_reached]
+    
+    WallClockCheck -- Yes --> BuildMsg[Assemble Prompt Layers & Delimiters]
+    BuildMsg --> CallModel[Call LLM with max_retries=0 & Per-Call Timeout]
+    
+    CallModel --> ModelSuccess{Model Response OK?}
+    ModelSuccess -- Timeout --> ModelTimeout[status: budget_exceeded<br>stop_reason: model_timeout]
+    ModelSuccess -- Error --> ModelError[status: failed<br>stop_reason: model_error]
+    
+    ModelSuccess -- Yes --> ParseJSON{Valid AgentDecision Schema?}
+    ParseJSON -- No / Invalid --> RepairCheck{repair_used == False & steps remain?}
+    RepairCheck -- Yes --> SetRepair[repair_used = True<br>Build Repair Prompt] --> LoopStart
+    RepairCheck -- No --> ContractError[status: contract_error<br>stop_reason: contract_error]
+    
+    ParseJSON -- Valid --> StatusSwitch{decision.status}
+    
+    StatusSwitch -- "continue" --> ToolGateway[call_tool Execution Gateway]
+    ToolGateway --> ToolSuccess{Tool Succeeded?}
+    ToolSuccess -- Yes --> RecordObs[Append Observation to State] --> LoopStart
+    ToolSuccess -- Rejected --> RecordObs
+    ToolSuccess -- Timeout/Malformed past retries --> ToolError[status: tool_error<br>stop_reason: tool_failure]
+    
+    StatusSwitch -- "completed" --> FinishGuard{state.itinerary != None?}
+    FinishGuard -- Yes --> ReturnCompleted[status: completed<br>stop_reason: completed]
+    FinishGuard -- No --> RefuseFinish[Observation: Call build_itinerary first] --> LoopStart
+    
+    StatusSwitch -- "needs_clarification" --> ReturnClarify[status: needs_clarification<br>stop_reason: needs_clarification]
+    StatusSwitch -- "blocked" --> ReturnBlocked[status: blocked<br>stop_reason: blocked]
+    StatusSwitch -- "approval_required" --> ReturnApproval[status: approval_required<br>stop_reason: approval_required]
+    StatusSwitch -- "failed" --> ReturnFailed[status: failed<br>stop_reason: model_failed]
 ```
 
-Open http://127.0.0.1:8000/ for the interface or /docs for API requests.
-Stop with Ctrl+C in the server terminal. If port 8000 is occupied, stop your old
-server or change PORT in .env to 8001 and open that port. Do not run two servers
-on the same port. On macOS/Linux use python3 and .venv/bin/python equivalents.
+### Folder Structure
 
-## What to implement
-1. Choose a narrow domain and complete the design canvas below.
-2. Replace data/sample_data.json with safe sandbox data.
-3. Define typed decisions and state in models.py; implement at least three tools.
-4. Write prompts.py and model integration. LangChain is allowed for models,
-   tools and messages; add your chosen provider package to requirements.txt.
-5. Implement the bounded loop, semantic validation, autonomy limits and recovery
-   in agent.py. Read request.arena_config.max_steps; count repair attempts too.
-6. Implement controlled fault injection at the model/tool boundary. The wrapper
-   parses faults but DOES NOT simulate them for you.
-7. Consume the history argument in your model messages to resolve clarification.
-   Add configured model identifiers to api.py /models and validate selection.
-8. Add rate/concurrency and spend controls before enabling paid calls publicly.
-9. Replace the starter manifest and examples, test, deploy and submit.
+```
+agent-arena-travel/
+├── app/
+│   ├── api.py           # FastAPI endpoints (/arena/run, /chat, /models, /health)
+│   ├── arena.py         # HTTP execution boundary and total latency tracking
+│   ├── agent.py         # Core bounded loop, repair handler, and event tracing
+│   ├── config.py        # Settings management with Pydantic BaseSettings
+│   ├── llm.py           # Model caller with max_retries=0 and explicit 429/timeout backoff
+│   ├── memory.py        # In-memory sliding window multi-turn conversation memory
+│   ├── models.py        # Pydantic HTTP contracts, AgentDecision schema, and semantic validators
+│   ├── prompts.py       # Layered prompt assembly, strict delimiter sanitization, and compact formatting
+│   ├── tools.py         # Deterministic tools (record, check, build) and execution gateway
+│   └── static/          # Web interface (chat UI, timeline, model picker, new chat)
+├── evaluation/
+│   ├── public_cases.json         # 14 evaluation test cases across all 6 Arena categories
+│   ├── run_public_tests.py       # Public benchmark runner with latency and status output
+│   ├── multi_turn_test.py        # Multi-turn clarification verification script
+│   ├── model_comparison.py       # Cross-model evaluation script
+│   └── results/                  # Generated benchmark and evaluation artifacts
+├── tests/
+│   └── test_agent.py    # 21 offline unit and integration tests (isolated, no API credits)
+├── arena_manifest.json  # Agent capabilities, tools, fault types, and limit declarations
+├── requirements.txt     # Pinned direct dependencies
+├── Dockerfile           # Python 3.12 container definition
+└── render.yaml          # Render deployment descriptor
+```
 
-## File map
-- main.py: FastAPI composition and static files.
-- api.py: routes, selected-model validation, session handoff.
-- config.py: environment configuration; limits require enforcement in your loop.
-- models.py: public contracts; add domain-specific state/decisions.
-- agent.py, prompts.py, tools.py: student TODOs.
-- memory.py: LangChain HumanMessage/AIMessage storage (six recent turns,
-  24,000-character ceiling, 100 sessions). In-memory only; one worker. New chat
-  clears server history; browser reload starts a new session. Not long-term memory.
-- arena.py: timeout wrapper, response bound, safe event logging.
-- static/: basic chat, selector, external note, status and observations.
+---
 
-## Arena contract
-GET /health; GET /arena/manifest; POST /arena/run. POST /chat is for the UI.
-Arena runs are independent: request_id is correlation only, not a memory key.
-Chat session_id links turns; each student chooses and documents sandbox persistence.
+## 4. Autonomy Boundaries
 
-The minimal request printed in the assignment works:
+The agent enforces strict separation between sandboxed planning and real-world operations:
+
+| Action Type | Examples | Agent Status | Enforcement Mechanism |
+| :--- | :--- | :--- | :--- |
+| **Sandbox Operations** | Extract flight dates, detect overlapping hotels, format day-by-day schedule. | `continue` or `completed` | Permitted via registered tools (`record_bookings`, `check_conflicts`, `build_itinerary`). |
+| **Real-World External Actions** | Charging credit card, booking live tickets on airline portal, emailing hotel. | `approval_required` or `blocked` | Enforced by system prompt policy and semantic action allowlist; model cannot invent unapproved action names. |
+| **Forbidden Operations** | Accessing user email inbox, executing code, modifying system files. | `blocked` | Action allowlist rejects any invented tool name (`outcome: rejected`). |
+
+---
+
+## 5. Model Comparison & Benchmark Results
+
+We benchmarked the allowed models (`openai/gpt-oss-120b` and `openai/gpt-oss-20b`) across 10 identical multi-step scenarios spanning normal planning, overlapping conflicts, missing information, prompt injections, and autonomy boundary requests.
+
+| Model | Task Success | Output Validity (No Repair) | Action Selection | Avg Latency (ms) | Total Tokens (In / Out) | Est. List Cost (USD)* |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `openai/gpt-oss-120b` | **80.0%** (8/10) | **100.0%** | **80.0%** | **6,234.1 ms** | 24,453 / 4,274 | $0.00623 |
+| `openai/gpt-oss-20b` | **60.0%** (6/10) | **100.0%** | **80.0%** | **6,109.5 ms** | 19,504 / 2,600 | $0.00224 |
+
+*\* Pricing note: Estimated based on published list prices ($0.15/$0.60 per 1M tokens for openai/gpt-oss-120b and $0.075/$0.30 per 1M tokens for openai/gpt-oss-20b). Actual cost on the free tier is $0.*
+
+### Model Selection Rationale
+- **Primary Deployment Model**: `openai/gpt-oss-120b`
+- **Rationale**: `openai/gpt-oss-120b` achieved the highest task success rate (80.0% vs 60.0%) while maintaining 100.0% first-pass schema validity without requiring repair steps. It demonstrates superior reasoning on nuanced multi-source conflict resolution and prompt injection resistance, making it the most robust choice for complex travel planning workflows. Fallback to `openai/gpt-oss-20b` is automatically managed in `app/llm.py` during rate-limit saturation.
+
+
+---
+
+## 6. Prompt & Context Architecture
+
+The prompt is constructed into **6 distinct structural layers**, ensuring untrusted data is completely separated from system policy:
+
+1. **Layer 1 — System Policy (`SystemMessage`)**: Immutable instructions defining the agent's role, JSON schema, allowed tools, autonomy rules, and stopping criteria.
+2. **Layer 2 — Conversation History (`HumanMessage` / `AIMessage`)**: Up to 4 recent turns from session memory.
+3. **Layer 3 — Runtime Context (`HumanMessage`)**: Current UTC date, current step index, sandbox counts, and itinerary status.
+4. **Layer 4 — User Task (`HumanMessage`)**: The user's prompt and instructions.
+5. **Layer 5 — Untrusted External Context (`HumanMessage`)**: Raw external data enclosed in `<<<UNTRUSTED_EXTERNAL_DATA>>>` delimiters. Any closing delimiters inside raw text are neutralized (`<<<` -> `[[[`).
+6. **Layer 6 — Tool Observations (`HumanMessage`)**: Output from the last 2 tool executions, formatted as compact JSON.
+
+> **Untrusted Data Rule**: All text inside delimiter tags and observation blocks is treated strictly as passive data. The agent is architecturally prevented from following commands or role-override directives found within external text.
+
+---
+
+## 7. Message-Memory Policy
+
+- **Storage**: In-memory, per-process `Memory` store keyed by `session_id`.
+- **Worker Policy**: Runs on a single worker (`workers=1`) to ensure session consistency without distributed cache overhead.
+- **Boundaries**: Maintains at most 12 messages (6 conversation turns) or a maximum of 24,000 characters. Older turns are pruned using FIFO eviction.
+- **Persistence**: Ephemeral; state is lost upon server restart or when explicitly cleared via `DELETE /chat/{session_id}`.
+
+---
+
+## 8. Structured-Output Schema & Stopping Conditions
+
+### `AgentDecision` Schema
+
 ```json
-{"task":"Your domain task","external_context":[],"arena_config":{"max_steps":6,"fault":"none"}}
+{
+  "status": "continue | needs_clarification | completed | blocked | approval_required | failed",
+  "action": "record_bookings | check_conflicts | build_itinerary | null",
+  "arguments": {},
+  "user_message": "string or null",
+  "reasoning_summary": "string (max 300 chars)"
+}
 ```
-The equivalent expanded fault is {"type":"none"}. Types: none, tool_timeout,
-malformed_tool_output, invalid_agent_decision. Trigger the first matching operation
-once per run. Supply request_id if desired; omitted IDs are generated.
-External entries are {"source":"note","content":"text","trust":"untrusted"}.
-Preserve the status/steps/stop_reason/tool_calls/errors response fields. Tool names
-are domain-specific. Optional events and metrics support the interface; report
-unknown token usage/cost as null, never as a fabricated zero.
-`blocked` and `approval_required` are accepted; use and document them consistently.
 
-## Test without spending API credits
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-```
-The bundled tests check infrastructure only. They are NOT the hidden evaluator.
-Add your own scripted-model tests. Cover ambiguity, injection, invalid decisions,
-tool failure, budget termination, autonomy, and multi-turn clarification.
+### Stopping Conditions Table
 
-With the server running:
-```powershell
-.\.venv\Scripts\python.exe evaluation/run_public_tests.py --url http://127.0.0.1:8000
-```
-This initial one-case check expects the not_implemented placeholder. Replace it
-with actual domain cases and expected outcomes. After model integration, this HTTP
-runner can cost money. Run deliberately; do not repeatedly call paid models on CI.
-
-## Render deployment
-Create a private GitHub repository from this extracted folder (not the ZIP file).
-Give the instructor access as announced in Google Classroom. In Render create a
-Web Service, connect your repository, and choose the Python runtime.
-- Build: pip install -r requirements.txt
-- Start: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
-- Health check: /health
-Select the free instance if available; confirm the displayed plan before deploying.
-render.yaml is an optional Blueprint alternative. Dockerfile is another option.
-Add your chosen model name and provider keys using Render environment settings.
-Never commit .env. No keys are needed to deploy the incomplete scaffold.
-Free services may restart or sleep; in-memory history is lost after restart.
-Verify both the browser interface and a POST through /docs on the public URL.
-A successful health response proves availability, not assignment completion.
-Deployment has not been performed for you by this ZIP.
-
-References: https://render.com/docs/deploy-fastapi
-and https://docs.langchain.com/oss/python/langchain/messages
-
-## Complete your project documentation
-- Problem and measurable completion condition
-- Design canvas: goal, completion, system boundary, observations, actions,
-  state, autonomy boundary, primary risks, evaluation criteria
-- Architecture diagram and file map
-- Model comparison: two models/tiers on approximately ten common inputs;
-  success, contract validity, action choice, latency, tokens and estimated cost
-- Prompt/context design, session isolation, reset and memory limitations
-- Typed schema and semantic validation rules
-- Loop, retry/time/token/step limits and stop conditions
-- Tool/fault handling and test evidence
-- Setup, deployment, limitations and submission links
-
-## Google Classroom submission
-Rename the outer project folder to your lowercase roll number,(mine is i230570) e.g. i221234.
-Prepare i221234.zip plus i221234_submission.pdf. Include SUBMISSION.md in the ZIP;
-put the same working interface URL, repository URL, endpoints and final source
-commit in the PDF. Submission metadata may be prepared after the source commit;
-identify the source version being evaluated clearly. Exclude .env, .venv, .git,
-node_modules, caches and secrets. Follow Section 19 of the assignment and click
-Turn in after attaching both files. Pushes alone are not official submissions.
+| Terminal Status | Deterministic `stop_reason` | Trigger Condition |
+| :--- | :--- | :--- |
+| `completed` | `completed` | Itinerary successfully built via `build_itinerary` and finalized. |
+| `needs_clarification` | `needs_clarification` | Essential booking details missing (e.g., date, route) or vague task with no bookings. |
+| `blocked` | `blocked` | Requested action is forbidden (e.g., live email dispatch, account login). |
+| `approval_required` | `approval_required` | Real-world payment or binding booking requested. |
+| `tool_error` | `tool_failure` | Sandbox tool timed out or produced malformed output past max retries (2). |
+| `contract_error` | `contract_error` | Model produced invalid schema/semantics twice in one run. |
+| `contract_error` | `no_steps_remaining_for_repair` | Model output was invalid on the final step (`step_count == max_steps`). |
+| `budget_exceeded` | `input_budget_exceeded` | Combined task and external context exceeded 20,000 characters. |
+| `budget_exceeded` | `step_budget_reached` | Loop reached `max_steps` (default 6) without reaching a terminal status. |
+| `budget_exceeded` | `token_budget_reached` | Model response was truncated by provider output token limit (`finish_reason='length'`). |
+| `budget_exceeded` | `model_timeout` | Model call timed out after retry. |
+| `budget_exceeded` | `time_budget_reached` | Total run time exceeded wall-clock budget (40s). |
+| `failed` | `model_error` / `internal_error` | Irrecoverable model provider error or unexpected exception. |
 
 ---
 
-## Agent Design Canvas
+## 9. Limitations
 
-### 1. Operational Goal
-Build a day-by-day sandbox travel itinerary from booking confirmations provided
-in the task, external context, or conversation history. Extract structured booking
-records, detect scheduling conflicts, and present an organized itinerary.
-
-### 2. Completion Condition
-The agent returns `completed` only after `build_itinerary` has successfully
-produced a day-by-day itinerary incorporating all recorded bookings, with any
-detected conflicts flagged in the output.
-
-### 3. System Boundary
-Sandbox only. The agent reads and structures booking text, stores records in
-per-run memory, checks for time conflicts, and assembles itineraries. It never
-calls external APIs, makes real bookings, processes payments, sends emails, or
-modifies any system outside the run's in-memory state.
-
-### 4. Observations
-| Source | Content | Trust |
-|---|---|---|
-| Task text | The user's request, possibly containing booking details | Trusted |
-| External context | Booking confirmations (flight emails, hotel vouchers, etc.) | **Untrusted** — isolated in a delimited message |
-| Conversation history | Prior `/chat` turns with additional bookings or clarification answers | Trusted |
-| Tool results | Structured output from record_bookings, check_conflicts, build_itinerary | Trusted |
-| Runtime context | Today's date (for temporal awareness, not for rejecting past dates) | Trusted |
-
-### 5. Actions / Tools
-| Action | Type | Purpose |
-|---|---|---|
-| `record_bookings` | Tool | Store model-extracted structured bookings (Pydantic-validated) |
-| `check_conflicts` | Tool | Detect time overlaps among same-category bookings |
-| `build_itinerary` | Tool | Assemble day-by-day itinerary; recomputes and includes conflicts |
-| `finish` | Terminal (status=completed) | Return the completed itinerary |
-| `ask_clarification` | Terminal (status=needs_clarification) | Request missing information from the user |
-| `request_approval` | Terminal (status=blocked) | Flag actions needing human approval |
-| `refuse` | Terminal (status=blocked) | Decline requests outside sandbox scope |
-
-### 6. State (per run)
-- Extracted bookings (`list[BookingRecord]`)
-- Detected conflicts (`list[dict]`)
-- Built itinerary (`dict | None`)
-- Step counter and shared repair flag (one repair per run)
-- Observations from each tool call
-- Known facts established during the run
-- Tool call traces, errors, and events
-
-### 7. Autonomy Boundary
-The agent operates entirely in a sandbox:
-- ✅ Extract and structure booking data from text
-- ✅ Detect conflicts and build itineraries
-- ✅ Ask for clarification when information is missing
-- ❌ Never make real bookings, payments, or cancellations
-- ❌ Never send emails or contact third parties
-- ❌ Never access external APIs or databases
-
-Any request for real-world action → `blocked` or `approval_required`.
-
-### 8. Primary Risks
-| Risk | Mitigation |
-|---|---|
-| Prompt injection via external_context | Structural isolation: untrusted content in a clearly delimited user message, never in the system prompt |
-| Hallucinated bookings | Prompt instructs: never invent dates, times, or confirmation codes not present in the provided text |
-| Infinite loops | Bounded loop with hard step limit (≤ 6); code owns stopping, not the model |
-| Step budget exhaustion | Happy path uses ≤ 4 steps, leaving room for 1 repair + 1 fault |
-| Timezone confusion | All datetimes normalized to UTC; naive datetimes treated as UTC (documented limitation) |
-| Token truncation | Provider finish_reason checked; truncated output → budget_exceeded immediately |
-| Unknown / consequential actions | One repair attempt listing allowed actions; if still unknown → contract_error |
-
-### 9. Evaluation Criteria
-- Valid `ArenaResponse` on every run (never crash)
-- Correct extraction of bookings from varied text formats
-- Accurate conflict detection (same-category interval overlap only)
-- Sensible day-by-day itinerary with conflicts flagged
-- Graceful handling of all fault types (tool_timeout, malformed_tool_output, invalid_agent_decision)
-- Stays within step budget (≤ 6 steps)
-- Resists prompt injection attempts
-- Asks for clarification when critical information is missing
-- Multi-turn resolution via chat history
+1. **UTC Normalization**: Naive datetimes without explicit timezone offsets are treated as UTC.
+2. **In-Memory Volatility**: Conversation memory is stored in RAM and resets upon server restart or container recycling.
+3. **Sandbox Scope**: The agent cannot execute real-world bookings, ticket payments, or send live emails.
+4. **Provider Rate Limits**: On free-tier LLM providers (e.g., Groq on-demand), rapid successive calls may trigger 429 backoff delays.
 
 ---
 
-## Architecture Diagram
-<!-- TODO: Add architecture diagram showing request flow through api → arena → agent → tools -->
+## 10. Evaluation & Evidence
 
-## Folder Map
-<!-- TODO: Add annotated folder/file tree -->
+- **Public Test Suite**: 14 test cases covering Ambiguity, Prompt Injection, Invalid Contract Faults, Tool Failures, Budget Limits, and Autonomy Boundaries located in [evaluation/public_cases.json](file:///c:/Users/areeb/Documents/Sem7/Agentic/A1/Agent_Arena_Student_Starter/agent-arena-travel/evaluation/public_cases.json).
+- **Public Results**: Generated test results stored in [evaluation/results/public_test_results.json](file:///c:/Users/areeb/Documents/Sem7/Agentic/A1/Agent_Arena_Student_Starter/agent-arena-travel/evaluation/results/public_test_results.json).
+- **Multi-Turn Evidence**: Multi-turn dialogue transcript stored in [evaluation/results/multi_turn_test.json](file:///c:/Users/areeb/Documents/Sem7/Agentic/A1/Agent_Arena_Student_Starter/agent-arena-travel/evaluation/results/multi_turn_test.json).
+- **Model Comparison**: Full comparative benchmark report stored in [evaluation/results/model_comparison.md](file:///c:/Users/areeb/Documents/Sem7/Agentic/A1/Agent_Arena_Student_Starter/agent-arena-travel/evaluation/results/model_comparison.md).
+- **Offline Unit Tests**: 21 unit and integration tests passing in [tests/test_agent.py](file:///c:/Users/areeb/Documents/Sem7/Agentic/A1/Agent_Arena_Student_Starter/agent-arena-travel/tests/test_agent.py).
 
-## Model Comparison
-<!-- TODO: Compare two models/tiers on ~10 common inputs: success rate, contract validity, action choice, latency, tokens, estimated cost -->
+---
 
-## Prompt and Context Design
-<!-- TODO: Document system prompt structure, message assembly order, external context isolation strategy -->
+## 11. Local Setup & Execution
 
-## Memory Policy
-<!-- TODO: Document session isolation, reset semantics, /chat vs /arena/run, memory size limits, restart behaviour -->
+### 1. Environment Setup
 
-## Structured-Output Schema
-<!-- TODO: Document AgentDecision fields, BookingRecord schema, tool I/O models -->
+```bash
+python -m venv .venv
+# On Windows:
+.venv\Scripts\activate
+# On Linux/macOS:
+source .venv/bin/activate
 
-## Validation Rules
-<!-- TODO: Document schema validation (Pydantic), semantic validation (separate functions), repair policy, gateway retry rules -->
+pip install -r requirements.txt
+```
 
-## Stopping Conditions
-<!-- TODO: Document all loop termination conditions: completed, needs_clarification, blocked, contract_error, budget_exceeded, finish guard -->
+### 2. Environment Configuration
 
-## Limitations
-- **Timezone handling**: Naive datetimes (without timezone offset) are treated as
-  UTC. Bookings in different cities without explicit timezone offsets will be
-  compared as if in the same timezone. Users should include timezone offsets
-  (e.g. `+05:00`, `-04:00`) in booking times for accurate cross-timezone
-  conflict detection.
-- **In-memory state**: All session data and per-run state are in RAM and lost on
-  server restart.
-- **Single worker**: The server runs one Uvicorn worker; not horizontally
-  scalable.
-- **Token budget**: `max_output_tokens` defaults to 512. Long itineraries or
-  detailed reasoning may be truncated by the provider.
+Create a `.env` file based on `.env.example`:
 
-## Local Setup
-<!-- TODO: Document any additional local setup steps beyond the starter README instructions -->
+```ini
+HOST=127.0.0.1
+PORT=8000
+MODEL_PROVIDER=groq
+MODEL_NAME=openai/gpt-oss-20b
+ALLOWED_MODELS=openai/gpt-oss-120b,openai/gpt-oss-20b
+GROQ_API_KEY=your_groq_api_key_here
+MAX_STEPS=6
+MAX_TOOL_RETRIES=2
+MAX_OUTPUT_TOKENS=800
+MAX_INPUT_CHARS=20000
+MODEL_CALL_TIMEOUT_SECONDS=12
+RUN_TIMEOUT_SECONDS=40
+```
 
-## Deployment
-<!-- TODO: Document Render deployment configuration and verification steps -->
+### 3. Run Server
+
+```bash
+python run.py
+```
+
+Navigate to `http://127.0.0.1:8000` to interact with the web interface or `http://127.0.0.1:8000/docs` for the Swagger API documentation.
+
+### 4. Run Offline Unit Tests
+
+```bash
+python -m unittest discover tests
+```
+
+### 5. Run Public Evaluation Benchmark
+
+```bash
+python evaluation/run_public_tests.py --url http://127.0.0.1:8000
+```
+
+### 6. Run Multi-Turn Clarification Test
+
+```bash
+python evaluation/multi_turn_test.py --url http://127.0.0.1:8000
+```
+
+---
+
+## 12. Deployment Instructions (Render)
+
+1. Create a **Web Service** on [Render](https://render.com).
+2. Connect your GitHub repository.
+3. Configure the following environment settings:
+   - **Environment**: `Python 3`
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1`
+   - **Health Check Path**: `/health`
+4. Add the required Environment Variables in Render Dashboard:
+   - `GROQ_API_KEY`: *(Secret API key)*
+   - `MODEL_PROVIDER`: `groq`
+   - `MODEL_NAME`: `openai/gpt-oss-20b`
+   - `ALLOWED_MODELS`: `openai/gpt-oss-120b,openai/gpt-oss-20b`
+   - `MAX_STEPS`: `6`
+   - `MAX_TOOL_RETRIES`: `2`
+   - `RUN_TIMEOUT_SECONDS`: `40`
+   - `MAX_OUTPUT_TOKENS`: `800`
+   - `MAX_INPUT_CHARS`: `20000`
