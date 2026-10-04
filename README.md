@@ -28,7 +28,7 @@ The **Travel Itinerary Builder** solves this by:
 | **6. Autonomy Boundary** | Autonomous sandbox planning only. Real-world destructive or external side-effects trigger terminal status `approval_required` or `blocked`. |
 | **7. Validation & Repair** | Pydantic v2 schema parsing + semantic validator (`validate_decision_semantics`). Max 1 repair attempt per run; second failure yields `contract_error`. |
 | **8. Memory Policy** | In-memory sliding window per `session_id` (max 12 messages, max 24,000 characters). Session memory is volatile and resets upon server restart. |
-| **9. Resource Budgets** | Max 6 logical steps, max 2 tool retries, max 800 output tokens, max 20,000 input characters, 12s per-call timeout, 40s total wall-clock budget. |
+| **9. Resource Budgets** | Max 6 logical steps, max 2 tool retries, max 1500 output tokens, max 20,000 input characters, 10s per-call timeout, 40s total wall-clock budget. |
 
 ---
 
@@ -243,9 +243,9 @@ ALLOWED_MODELS=openai/gpt-oss-120b,openai/gpt-oss-20b
 GROQ_API_KEY=your_groq_api_key_here
 MAX_STEPS=6
 MAX_TOOL_RETRIES=2
-MAX_OUTPUT_TOKENS=800
+MAX_OUTPUT_TOKENS=1500
 MAX_INPUT_CHARS=20000
-MODEL_CALL_TIMEOUT_SECONDS=12
+MODEL_CALL_TIMEOUT_SECONDS=10
 RUN_TIMEOUT_SECONDS=40
 ```
 
@@ -294,5 +294,5 @@ python evaluation/multi_turn_test.py --url http://127.0.0.1:8000
    - `MAX_STEPS`: `6`
    - `MAX_TOOL_RETRIES`: `2`
    - `RUN_TIMEOUT_SECONDS`: `40`
-   - `MAX_OUTPUT_TOKENS`: `800`
+   - `MAX_OUTPUT_TOKENS`: `1500`
    - `MAX_INPUT_CHARS`: `20000`
