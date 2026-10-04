@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: agent-arena-student
+    name: agent-arena-travel
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -8,6 +8,22 @@ services:
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.12.10
+        value: 3.12.8
       - key: MODEL_PROVIDER
-        value: unconfigured
+        value: groq
+      - key: MODEL_NAME
+        value: openai/gpt-oss-120b
+      - key: ALLOWED_MODELS
+        value: openai/gpt-oss-120b,openai/gpt-oss-20b
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MAX_STEPS
+        value: "6"
+      - key: MAX_TOOL_RETRIES
+        value: "2"
+      - key: RUN_TIMEOUT_SECONDS
+        value: "40"
+      - key: MAX_OUTPUT_TOKENS
+        value: "800"
+      - key: MAX_INPUT_CHARS
+        value: "20000"

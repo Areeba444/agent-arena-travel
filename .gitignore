@@ -3,8 +3,13 @@
 !.env.example
 .venv/
 venv/
+.git/
 __pycache__/
 *.pyc
 node_modules/
 .pytest_cache/
 *.log
+*.zip
+caches/
+.coverage
+htmlcov/
