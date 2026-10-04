@@ -1,0 +1,26 @@
+{
+  "arena_version": "0.1",
+  "agent_name": "Travel Itinerary Builder",
+  "domain": "Travel itinerary planning",
+  "description": "Extracts bookings from confirmation texts, detects scheduling conflicts, and builds day-by-day sandbox itineraries. Handles flights, hotels, trains, and activities.",
+  "endpoint": "/arena/run",
+  "health_endpoint": "/health",
+  "implementation": "student",
+  "tools": [
+    "record_bookings",
+    "check_conflicts",
+    "build_itinerary"
+  ],
+  "fault_types": [
+    "none",
+    "tool_timeout",
+    "malformed_tool_output",
+    "invalid_agent_decision"
+  ],
+  "limits": {
+    "max_steps": 6,
+    "max_tool_retries": 2,
+    "run_timeout_seconds": 40,
+    "max_response_bytes": 50000
+  }
+}
