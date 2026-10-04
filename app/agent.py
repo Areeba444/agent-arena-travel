@@ -139,7 +139,7 @@ async def run_agent(
             request=request,
             history=history,
             state=state,
-            observations=state.observations[-3:] if state.observations else []
+            observations=state.observations[-2:] if state.observations else []
         )
         if pending_repair_message is not None:
             messages.append(pending_repair_message)
@@ -147,18 +147,47 @@ async def run_agent(
 
         # Execute Model Call
         state.step_count += 1
-        state.model_calls += 1
-        state.events.append({"step": state.step_count, "event": "model_call"})
+        per_call_timeout = min(getattr(settings, "model_call_timeout_seconds", 12.0), max(0.5, remaining))
 
-        model_timeout = min(getattr(settings, "model_call_timeout_seconds", 10.0), max(0.5, remaining))
+        call_t0 = time.perf_counter()
         try:
-            reply: ModelReply = await asyncio.wait_for(caller(messages), timeout=model_timeout)
+            import inspect
+            sig = inspect.signature(caller) if callable(caller) else None
+            if sig and 'remaining_budget' in sig.parameters:
+                reply: ModelReply = await caller(messages, remaining_budget=remaining, per_call_timeout=per_call_timeout)
+            else:
+                reply: ModelReply = await asyncio.wait_for(caller(messages), timeout=per_call_timeout)
         except (asyncio.TimeoutError, TimeoutError):
+            state.model_calls = min(6, state.model_calls + 1)
+            call_latency = (time.perf_counter() - call_t0) * 1000.0
+            state.events.append({
+                "step": state.step_count,
+                "event": "model_call",
+                "latency_ms": round(call_latency, 2),
+                "input_tokens": None,
+                "output_tokens": None,
+                "finish_reason": "timeout"
+            })
             state.errors.append({"step": state.step_count, "error": "Model call timed out."})
             return _build_final_response("budget_exceeded", "The model call timed out.", "model_timeout")
         except Exception as e:
+            state.model_calls = min(6, state.model_calls + 1)
             state.errors.append({"step": state.step_count, "error": f"Model invocation error: {e}"})
             return _build_final_response("failed", "The agent failed to receive a model response.", "model_error")
+
+        call_latency = (time.perf_counter() - call_t0) * 1000.0
+        calls_used = getattr(reply, "calls_made", 1)
+        state.model_calls = min(6, state.model_calls + calls_used)
+
+        # 1. Observability: record latency_ms, input_tokens, output_tokens, finish_reason (no raw prompts)
+        state.events.append({
+            "step": state.step_count,
+            "event": "model_call",
+            "latency_ms": round(call_latency, 2),
+            "input_tokens": reply.input_tokens,
+            "output_tokens": reply.output_tokens,
+            "finish_reason": reply.finish_reason
+        })
 
         # Accumulate token metrics
         if reply.input_tokens is not None:

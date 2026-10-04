@@ -18,6 +18,14 @@ ip_request_history: dict[str, list[float]] = defaultdict(list)
 concurrency_semaphore = asyncio.Semaphore(settings.max_concurrency)
 
 
+def get_client_ip(request: Request) -> str:
+    """Extracts client IP, respecting X-Forwarded-For when behind reverse proxies like Render."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def check_rate_limit(client_ip: str) -> None:
     """Enforces per-IP sliding window rate limit."""
     now = time.time()
@@ -34,21 +42,26 @@ def check_rate_limit(client_ip: str) -> None:
 
 
 class ConcurrencyGuard:
-    """Async context manager for global concurrency capping with immediate 429 rejection."""
-    def __init__(self, sem: asyncio.Semaphore):
+    """Async context manager for global concurrency capping; waits up to 15s for an available slot before 429."""
+    def __init__(self, sem: asyncio.Semaphore, timeout: float = 15.0):
         self.sem = sem
+        self.timeout = timeout
+        self.acquired = False
 
     async def __aenter__(self):
-        if self.sem._value <= 0:
+        try:
+            await asyncio.wait_for(self.sem.acquire(), timeout=self.timeout)
+            self.acquired = True
+            return self
+        except (asyncio.TimeoutError, TimeoutError):
             raise HTTPException(
                 status_code=429,
                 detail="Global concurrency limit exceeded (maximum concurrent runs active). Please retry shortly."
             )
-        await self.sem.acquire()
-        return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.sem.release()
+        if self.acquired:
+            self.sem.release()
 
 
 # ─── Endpoints ──────────────────────────────────────────────────────
@@ -79,7 +92,7 @@ def models():
 
 @router.post('/arena/run', response_model=ArenaResponse)
 async def arena_run(payload: ArenaRequest, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
     check_rate_limit(client_ip)
 
     async with ConcurrencyGuard(concurrency_semaphore):
@@ -95,7 +108,7 @@ async def chat(payload: ChatRequest, request: Request):
     elif selected_model not in allowed_list and selected_model != 'unconfigured':
         raise HTTPException(400, 'Model is not enabled')
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
     check_rate_limit(client_ip)
 
     busy = request.app.state.busy

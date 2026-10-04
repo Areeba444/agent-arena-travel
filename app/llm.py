@@ -1,7 +1,9 @@
-"""LLM caller integration for Groq models with rate limit handling and usage tracking."""
+"""LLM caller integration for Groq models with explicit rate limit handling and usage tracking."""
 import asyncio
 import json
 import logging
+import re
+import time
 from typing import Any, Awaitable, Callable, List, Optional
 from pydantic import BaseModel, ConfigDict
 from langchain_core.messages import BaseMessage
@@ -19,67 +21,114 @@ class ModelReply(BaseModel):
     finish_reason: Optional[str] = None  # 'stop' or 'length'
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    calls_made: int = 1
 
 
-ModelCaller = Callable[[List[BaseMessage]], Awaitable[ModelReply]]
+ModelCaller = Callable[..., Awaitable[ModelReply]]
+
+
+def _parse_retry_after(err_str: str) -> float:
+    """Extracts suggested retry delay in seconds from error string if available."""
+    match = re.search(r'try again in ([\d\.]+)s', err_str)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    match_sec = re.search(r'retry[- ]after[:\s]+([\d\.]+)', err_str)
+    if match_sec:
+        try:
+            return float(match_sec.group(1))
+        except ValueError:
+            pass
+    return 1.5
+
+
+_daily_quota_exhausted_models: set[str] = set()
 
 
 def get_model_caller(model_identifier: str = "") -> ModelCaller:
-    """Creates a model caller for the requested model identifier.
-
-    Enforces allowed model list, API key security, 429 retries, and usage normalization.
-    """
+    """Creates a model caller with explicit 429/timeout retries and max_retries=0."""
     selected_model = model_identifier if (model_identifier and model_identifier != "unconfigured") else settings.model_name
     allowed = settings.allowed_models_list
 
-    # Validate model selection
     if selected_model and selected_model != "unconfigured" and allowed and selected_model not in allowed:
-        raise ValueError(
-            f"Model '{selected_model}' is not permitted. Allowed models: {', '.join(allowed)}"
-        )
+        raise ValueError(f"Model '{selected_model}' is not permitted. Allowed models: {', '.join(allowed)}")
 
-    async def _caller(messages: List[BaseMessage]) -> ModelReply:
+    async def _caller(messages: List[BaseMessage], remaining_budget: float = 40.0, per_call_timeout: Optional[float] = None) -> ModelReply:
         api_key = settings.groq_api_key
 
         if api_key and selected_model and selected_model != "unconfigured":
             from langchain_groq import ChatGroq
 
-            # Configure ChatGroq with reasoning_format='hidden' and reasoning_effort='low' so output tokens
-            # are not wasted on internal chain-of-thought tokens for supported models
-            llm = ChatGroq(
-                model=selected_model,
-                api_key=api_key,
-                max_tokens=settings.max_output_tokens,
-                temperature=0.1,
-                reasoning_format="hidden",
-                reasoning_effort="low",
-            )
+            # Select active model (bypassing any models known to have exhausted daily quota)
+            active_model = selected_model
+            if active_model in _daily_quota_exhausted_models and len(allowed) > 1:
+                alt = next((m for m in allowed if m not in _daily_quota_exhausted_models), None)
+                if alt:
+                    active_model = alt
 
-            # Execution with one bounded 429 retry
-            max_429_retries = 1
-            for attempt in range(max_429_retries + 1):
+            call_timeout = per_call_timeout or min(getattr(settings, "model_call_timeout_seconds", 12.0), remaining_budget)
+            calls_made = 0
+            res = None
+            max_attempts = 4
+
+            for attempt in range(1, max_attempts + 1):
+                calls_made += 1
+                llm = ChatGroq(
+                    model=active_model,
+                    api_key=api_key,
+                    max_tokens=settings.max_output_tokens,
+                    temperature=0.1,
+                    max_retries=0,
+                    reasoning_format="hidden",
+                    reasoning_effort="low",
+                )
                 try:
-                    res = await llm.ainvoke(messages)
+                    res = await asyncio.wait_for(llm.ainvoke(messages), timeout=call_timeout)
                     break
+                except (asyncio.TimeoutError, TimeoutError):
+                    if attempt < max_attempts and (remaining_budget - call_timeout) >= 6.0:
+                        logger.warning("Model call timed out; retrying...")
+                        continue
+                    raise
                 except Exception as e:
                     err_str = str(e).lower()
+                    is_daily_quota = "tokens per day" in err_str or "tpd" in err_str
                     is_rate_limit = "429" in err_str or "rate limit" in err_str or "ratelimit" in err_str
-                    if is_rate_limit and attempt < max_429_retries:
-                        logger.warning("Groq rate limit encountered (429). Retrying after 1.5s backoff...")
-                        await asyncio.sleep(1.5)
+
+                    if is_daily_quota:
+                        _daily_quota_exhausted_models.add(active_model)
+                        alt = next((m for m in allowed if m not in _daily_quota_exhausted_models), None)
+                        if alt and alt != active_model:
+                            logger.warning("Daily quota reached on %s; switching to %s", active_model, alt)
+                            active_model = alt
+                            continue
+
+                    if is_rate_limit and attempt < max_attempts and remaining_budget > 5.0:
+                        retry_hint = _parse_retry_after(str(e))
+                        wait_time = min(retry_hint, 3.5, max(1.0, remaining_budget - 4.0))
+                        logger.warning("Groq rate limit (429) on %s. Retrying after %.1fs pause...", active_model, wait_time)
+                        await asyncio.sleep(wait_time)
                         continue
-                    logger.error("LLM invocation failed: %s", type(e).__name__)
+
+                    # If rate limit persists and alternative allowed model exists, try it
+                    if is_rate_limit and len(allowed) > 1:
+                        alt = next((m for m in allowed if m != active_model and m not in _daily_quota_exhausted_models), None)
+                        if alt:
+                            logger.warning("429 rate limit on %s; attempting %s", active_model, alt)
+                            active_model = alt
+                            continue
+
                     raise
 
-            # Extract text content (handling string vs list of parts)
+            if res is None:
+                raise RuntimeError("Failed to receive LLM response.")
+
+            # Extract text
             raw_content = res.content
             if isinstance(raw_content, list):
-                text_parts = []
-                for part in raw_content:
-                    if isinstance(part, str):
-                        text_parts.append(part)
-                    elif isinstance(part, dict) and "text" in part:
-                        text_parts.append(str(part["text"]))
+                text_parts = [str(p if isinstance(p, str) else p.get("text", "")) for p in raw_content]
                 final_text = "".join(text_parts)
             else:
                 final_text = str(raw_content)
@@ -91,15 +140,15 @@ def get_model_caller(model_identifier: str = "") -> ModelCaller:
                 if raw_finish in ("length", "max_tokens"):
                     finish_reason = "length"
 
-            # Extract token usage (None if missing, never 0)
+            # Extract usage tokens
             input_tokens = None
             output_tokens = None
             if hasattr(res, "usage_metadata") and res.usage_metadata:
                 in_tok = res.usage_metadata.get("input_tokens")
                 out_tok = res.usage_metadata.get("output_tokens")
-                if in_tok is not None and isinstance(in_tok, int) and in_tok > 0:
+                if in_tok and isinstance(in_tok, int) and in_tok > 0:
                     input_tokens = in_tok
-                if out_tok is not None and isinstance(out_tok, int) and out_tok > 0:
+                if out_tok and isinstance(out_tok, int) and out_tok > 0:
                     output_tokens = out_tok
 
             return ModelReply(
@@ -107,6 +156,7 @@ def get_model_caller(model_identifier: str = "") -> ModelCaller:
                 finish_reason=finish_reason,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                calls_made=calls_made
             )
 
         # Fallback when unconfigured
@@ -115,12 +165,13 @@ def get_model_caller(model_identifier: str = "") -> ModelCaller:
                 "status": "failed",
                 "action": None,
                 "arguments": {},
-                "user_message": "Model provider is unconfigured or credentials missing.",
-                "reasoning_summary": "Unconfigured model provider fallback."
+                "user_message": "Model provider is unconfigured.",
+                "reasoning_summary": "Unconfigured model provider."
             }),
             finish_reason="stop",
             input_tokens=None,
             output_tokens=None,
+            calls_made=1
         )
 
     return _caller
