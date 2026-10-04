@@ -600,7 +600,7 @@ class DomainAgentTests(unittest.IsolatedAsyncioTestCase):
             session = "multi-turn-session-987654"
 
             # Turn 1: Model asks clarification
-            with patch("app.agent._create_default_model_caller") as mock_caller_factory:
+            with patch("app.agent.get_model_caller") as mock_caller_factory:
                 async def caller_turn1(messages):
                     return ModelReply(text=json.dumps({
                         "status": "needs_clarification",
@@ -620,7 +620,7 @@ class DomainAgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(client.app.state.memory.get(session)), 2)
 
             # Turn 2: User provides missing detail; model builds and completes
-            with patch("app.agent._create_default_model_caller") as mock_caller_factory:
+            with patch("app.agent.get_model_caller") as mock_caller_factory:
                 step = 0
                 async def caller_turn2(messages):
                     nonlocal step
