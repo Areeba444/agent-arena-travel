@@ -1,0 +1,25 @@
+{
+  "session_id": "session-clarify-e2ed52dc83084994",
+  "turns": [
+    {
+      "turn": 1,
+      "task": "Please build an itinerary for my flight. Flight: Emirates EK-205 from Milan (MXP) to New York (JFK), departing at 14:00 and arriving at 17:30 (booking code EK-9912). Passenger: Elena Rostova.",
+      "status": "needs_clarification",
+      "stop_reason": "needs_clarification",
+      "steps": 1,
+      "latency_ms": 1312.12,
+      "final_response": "Please provide the date of the flight (departure date) so I can record the booking with proper datetime values."
+    },
+    {
+      "turn": 2,
+      "task": "The departure date for flight EK-9912 is November 10, 2026 (2026-11-10).",
+      "status": "completed",
+      "stop_reason": "completed",
+      "steps": 3,
+      "latency_ms": 5428.93,
+      "final_response": "Itinerary for Elena Rostova:\n\nTitle: Elena Rostova's Trip\nDates: 2026-11-10\n\n- 14:00\u201317:30: Emirates EK-205 Milan (MXP) \u2192 New York (JFK) (Flight, Confirmation EK-9912). Passenger: Elena Rostova.\nNo conflicts detected.\n\nItinerary Schedule:\nTrip: Elena Rostova's Trip\n\nDate: 2026-11-10\n  - [2026-11-10 14:00] Emirates EK-205 Milan (MXP) \u2192 New York (JFK)"
+    }
+  ],
+  "success": true,
+  "cleared": true
+}
