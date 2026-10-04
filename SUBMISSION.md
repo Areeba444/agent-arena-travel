@@ -7,7 +7,7 @@ Replace placeholders with your roll number. Copy these details into your submiss
 - University email: i230570@isb.nu.edu.pk
 - GitHub username: Areeba444
 - Agent name and domain: Travel Itinerary Builder (Travel Itinerary Planning)
-- Private GitHub repository URL: TO FILL
+- Private GitHub repository URL: https://github.com/Areeba444/agent-arena-travel
 - Final source commit hash: TO FILL
 - Working public agent interface URL: https://agent-arena-travel.onrender.com/
 - GET /health URL: https://agent-arena-travel.onrender.com/health
