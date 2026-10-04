@@ -30,78 +30,9 @@ from app.prompts import (
     input_too_large,
 )
 from app.tools import call_tool
+from app.llm import ModelCaller, ModelReply, get_model_caller
 
 logger = logging.getLogger("agent")
-
-
-class ModelReply(BaseModel):
-    """Normalized response from an LLM call."""
-    model_config = ConfigDict(extra='ignore')
-
-    text: str = ""
-    finish_reason: Optional[str] = None  # e.g., 'stop', 'length', 'max_tokens'
-    input_tokens: Optional[int] = None
-    output_tokens: Optional[int] = None
-
-
-ModelCaller = Callable[[List[BaseMessage]], Awaitable[ModelReply]]
-
-
-def _create_default_model_caller(model_identifier: str) -> ModelCaller:
-    """Creates a default model caller using LangChain or returns a safe unconfigured stub."""
-    async def _caller(messages: List[BaseMessage]) -> ModelReply:
-        provider = settings.model_provider.lower()
-        model_name = model_identifier if model_identifier != 'unconfigured' else settings.model_name
-
-        if provider == 'groq' and model_name:
-            try:
-                from langchain_groq import ChatGroq
-                llm = ChatGroq(
-                    model=model_name,
-                    max_tokens=settings.max_output_tokens,
-                    temperature=0.1,
-                )
-                res = await llm.ainvoke(messages)
-                
-                # Extract token usage if present
-                input_tokens = None
-                output_tokens = None
-                if hasattr(res, "usage_metadata") and res.usage_metadata:
-                    input_tokens = res.usage_metadata.get("input_tokens")
-                    output_tokens = res.usage_metadata.get("output_tokens")
-                
-                # Extract finish reason
-                finish_reason = None
-                if hasattr(res, "response_metadata") and res.response_metadata:
-                    finish_reason = res.response_metadata.get("finish_reason")
-
-                return ModelReply(
-                    text=str(res.content),
-                    finish_reason=finish_reason,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens
-                )
-            except ImportError:
-                logger.warning("langchain_groq package not installed; falling back to unconfigured response.")
-            except Exception as e:
-                logger.error("Provider invocation error: %s", e)
-                raise
-
-        # Default fallback when unconfigured
-        return ModelReply(
-            text=json.dumps({
-                "status": "failed",
-                "action": None,
-                "arguments": {},
-                "user_message": "Model provider is unconfigured or credentials missing.",
-                "reasoning_summary": "Unconfigured model provider fallback."
-            }),
-            finish_reason="stop",
-            input_tokens=None,
-            output_tokens=None
-        )
-
-    return _caller
 
 
 async def run_agent(
@@ -120,7 +51,7 @@ async def run_agent(
     if callable(model):
         caller: ModelCaller = model
     else:
-        caller = _create_default_model_caller(str(model))
+        caller = get_model_caller(str(model))
 
     # 2. Initialize Agent State
     start_time = time.perf_counter()

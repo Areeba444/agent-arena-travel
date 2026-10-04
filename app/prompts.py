@@ -70,6 +70,7 @@ Rules for fields:
      - 'category' MUST be strictly one of: 'transport', 'accommodation', 'activity'.
      - If no end time is given (e.g. departure time only), set 'end_datetime' EQUAL to 'start_datetime' and 'end_text' equal to 'start_text'. NEVER invent an end time.
      - Always copy original time text into 'start_text' and 'end_text' verbatim.
+     - Convert dates and times to standard ISO-8601 strings (e.g. 'YYYY-MM-DDTHH:MM:SS'). If timezone offset is not explicitly stated in the source text, use standard ISO datetime (e.g. '2026-11-05T08:30:00') directly and proceed; do NOT ask for timezones.
 
 2. check_conflicts
    - Purpose: Detect [start, end) interval overlaps between bookings within the SAME category.
