@@ -91,6 +91,9 @@ async def run_agent(
             "event": "agent_stop",
             "status": status,
             "reason": stop_reason,
+            "bookings": [b.model_dump(mode="json") for b in state.bookings] if state.bookings else [],
+            "conflicts": state.conflicts,
+            "itinerary": state.itinerary
         })
 
         return ArenaResponse(
@@ -294,7 +297,8 @@ async def run_agent(
                 "step": state.step_count,
                 "event": "tool_execution",
                 "tool": tool_name,
-                "outcome": tool_result.outcome
+                "outcome": tool_result.outcome,
+                "data": tool_result.data
             })
 
             if tool_result.ok:
