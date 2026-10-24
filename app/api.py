@@ -68,7 +68,10 @@ class ConcurrencyGuard:
 
 @router.get('/')
 def index():
-    return FileResponse(ROOT / 'app/static/index.html')
+    return FileResponse(
+        ROOT / 'app/static/index.html',
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
+    )
 
 
 @router.get('/health')
